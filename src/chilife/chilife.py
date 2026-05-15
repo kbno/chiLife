@@ -47,13 +47,13 @@ from .SpinLabelTraj import SpinLabelTraj
 
 logging.captureWarnings(True)
 
-
 def distance_distribution(
     *args: "SpinLabel",
     r: "ArrayLike" = None,
     sigma: float = 1.0,
     use_spin_centers: bool = True,
     dependent: bool = False,
+    average_mode: str = "frame",
     uq: bool = False,
 ) -> np.ndarray:
     """Calculates total distribution of spin-spin distances among an arbitrary number of spin labels, using the
@@ -76,6 +76,11 @@ def distance_distribution(
         computed by summing over the distributed spin density on spin-bearing atoms on the labels.
     dependent: bool
         Consider the (clash) effects of spin label rotamers on each other.
+    average_mode : str
+        Strategy used when any argument is a ``SpinLabelTraj``. ``"frame"`` computes a normalized
+        distribution per frame and averages those distributions. ``"pooled"`` concatenates weighted
+        pairwise distances across frames, then computes a single histogram and optional convolution.
+        Defaults to ``"frame"``.
     uq : bool
         Perform uncertainty analysis (experimental)
 
@@ -96,19 +101,26 @@ def distance_distribution(
     if r is None:
         raise TypeError("Keyword argument r with distance domain vector is missing.")
 
-    if any(
-        not hasattr(arg, atr)
-        for arg in args
-        for atr in ["spin_coords", "spin_centers", "weights"]
-    ):
-        raise TypeError(
-            "Arguments other than spin labels must be passed as a keyword arguments."
-        )
+    # if any(
+    #     not hasattr(arg, atr)
+    #     for arg in args
+    #     for atr in ["spin_coords", "spin_centers", "weights"]
+    # ):
+    #     raise TypeError(
+    #         "Arguments other than spin labels must be passed as a keyword arguments."
+    #     )
 
     r = np.asarray(r)
 
     if any(isinstance(SL, SpinLabelTraj) for SL in args):
-        P = traj_dd(*args, r=r, sigma=sigma)
+        P = traj_dd(
+            *args,
+            r=r,
+            sigma=sigma,
+            use_spin_centers=use_spin_centers,
+            dependent=dependent,
+            average_mode=average_mode,
+        )
         return P
 
     elif uq:
@@ -256,12 +268,15 @@ def pair_dd(
     if sigma != 0:
         delta_r = get_delta_r(r)
         _, g = normdist(delta_r, 0, sigma)
+        if len(g) > len(hist):
+            start = (len(g) - len(hist)) // 2
+            g = g[start : start + len(hist)]
         P = np.convolve(hist, g, mode="same")
     else:
         P = hist
 
     # Normalize distribution
-    integral = np.trapezoid(P, r)
+    integral = np.trapz(P, r)
     if integral != 0:
         P /= integral
 
@@ -273,6 +288,9 @@ def traj_dd(
     SL2: "SpinLabelTraj",
     r: "ArrayLike",
     sigma: float,
+    use_spin_centers: bool = True,
+    dependent: bool = False,
+    average_mode: str = "frame",
     **kwargs,
 ) -> np.ndarray:
     """Calculate a distance distribution from a trajectory of spin labels by calling ``distance_distribution`` on each
@@ -286,6 +304,14 @@ def traj_dd(
         Distance domain to use when calculating distance distribution.
     sigma : float
         Standard deviation of the gaussian kernel used to smooth the distance distribution
+    use_spin_centers : bool
+        If False, distances are computed between spin centers. If True, distances are computed by
+        summing over the distributed spin density on spin-bearing atoms on the labels.
+    dependent: bool
+        Consider the (clash) effects of spin label rotamers on each other.
+    average_mode : str
+        ``"frame"`` averages per-frame normalized distributions.
+        ``"pooled"`` computes one pooled histogram over all trajectory frames before normalization.
     **kwargs : dict, optional
         Additional keyword arguments to pass to ``distance_distribution`` .
 
@@ -299,13 +325,112 @@ def traj_dd(
     if len(SL1) != len(SL2):
         raise ValueError("SpinLabelTraj objects must have the same length")
 
-    # Calculate the distance distribution for each frame and sum
-    P = np.zeros_like(r)
-    for _SL1, _SL2 in zip(SL1, SL2):
-        P += distance_distribution(_SL1, _SL2, r=r, sigma=sigma, **kwargs)
+    if average_mode not in {"frame", "pooled"}:
+        raise ValueError("average_mode must be one of {'frame', 'pooled'}")
+
+    if average_mode == "frame":
+        # Calculate a normalized distance distribution for each frame and average them.
+        P = np.zeros_like(r)
+        for _SL1, _SL2 in zip(SL1, SL2):
+            P += pair_dd(
+                _SL1,
+                _SL2,
+                r=r,
+                sigma=sigma,
+                use_spin_centers=use_spin_centers,
+                dependent=dependent,
+            )
+
+    else:
+        # Pool weighted distances across all frames and build one global histogram.
+        distances, weights = [], []
+        for _SL1, _SL2 in zip(SL1, SL2):
+            if use_spin_centers:
+                coords1 = _SL1.spin_centers
+                coords2 = _SL2.spin_centers
+                weights1 = _SL1.weights
+                weights2 = _SL2.weights
+            else:
+                coords1 = _SL1.spin_coords.reshape(-1, 3)
+                coords2 = _SL2.spin_coords.reshape(-1, 3)
+                weights1 = np.outer(_SL1.weights, _SL1.spin_weights).flatten()
+                weights2 = np.outer(_SL2.weights, _SL2.spin_weights).flatten()
+
+            frame_dist = cdist(coords1, coords2).flatten()
+            frame_weights = np.outer(weights1, weights2).flatten()
+
+            if dependent:
+                if not isinstance(_SL1.energy_func, ljEnergyFunc):
+                    raise RuntimeError(
+                        "Currently only ljEnergyFunc objects are supported when using dependent=True"
+                    )
+
+                if (
+                    _SL1.energy_func.join_rmin is not _SL2.energy_func.join_rmin
+                    or _SL1.energy_func.join_eps is not _SL2.energy_func.join_eps
+                ):
+                    raise RuntimeError(
+                        "At least two labels passed use different energy functions. Make sure all "
+                        "labels use the same energy functions when setting `dependent=True`. This does not"
+                        "mean that the energy functions use the same parameters. They have to be the SAME "
+                        "object and satisfy `SL1.energy_func is SL2.energy_func`. This can be achieved be "
+                        "creating an energy function object"
+                    )
+
+                nat1, nat2 = len(_SL1.side_chain_idx), len(_SL2.side_chain_idx)
+                join_rmin = _SL1.energy_func.join_rmin
+                join_eps = _SL1.energy_func.join_eps
+
+                rmin_ij = join_rmin(_SL1.rmin2, _SL2.rmin2)
+                eps_ij = join_eps(_SL1.eps, _SL2.eps)
+
+                rot_coords1 = _SL1.coords[:, _SL1.side_chain_idx]
+                rot_coords2 = _SL2.coords[:, _SL2.side_chain_idx].reshape(-1, 3)
+
+                ljs = []
+                for rots in rot_coords1:
+                    lj = cdist(rots, rot_coords2)
+                    lj = lj.reshape(1, nat1, len(_SL2), nat2).transpose(0, 2, 1, 3)
+
+                    lj = rmin_ij[None, None, ...] / lj
+                    lj = lj * lj * lj
+                    lj = lj * lj
+                    lj = lj * lj
+
+                    # Cap
+                    lj[lj > 10] = 10
+                    # Rep only
+                    lj = eps_ij * (lj * lj)
+                    lj = lj.sum(axis=(2, 3))
+                    ljs.append(lj)
+
+                ljs = np.concatenate(ljs)
+                frame_weights, _ = reweight_rotamers(
+                    ljs.flatten(), _SL1.temp, frame_weights
+                )
+
+            distances.append(frame_dist)
+            weights.append(frame_weights)
+
+        distances = np.concatenate(distances)
+        weights = np.concatenate(weights)
+
+        hist, _ = np.histogram(
+            distances, weights=weights, range=(min(r), max(r)), bins=len(r)
+        )
+
+        if sigma != 0:
+            delta_r = get_delta_r(r)
+            _, g = normdist(delta_r, 0, sigma)
+            if len(g) > len(hist):
+                start = (len(g) - len(hist)) // 2
+                g = g[start : start + len(hist)]
+            P = np.convolve(hist, g, mode="same")
+        else:
+            P = hist
 
     # Normalize distance distribution
-    P /= np.trapezoid(P, r)
+    P /= np.trapz(P, r)
 
     return P
 

@@ -113,49 +113,137 @@ def distance_distribution(
     r = np.asarray(r)
 
     if any(isinstance(SL, SpinLabelTraj) for SL in args):
-        P = traj_dd(
+        P, P_low, P_high = traj_dd(
             *args,
             r=r,
             sigma=sigma,
             use_spin_centers=use_spin_centers,
             dependent=dependent,
             average_mode=average_mode,
+            uq=uq,
         )
-        return P
-
-    elif uq:
-        Ps = []
-        n_boots = uq if uq > 1 else 100
-        for i in range(n_boots):
-            dummy_labels = []
-            for SL in args:
-                idxs = np.random.choice(len(SL), len(SL))
-
-                dummy_SL = mock.Mock()
-                dummy_SL.spin_coords = np.atleast_2d(SL.spin_coords[idxs])
-                dummy_SL.spin_centers = np.atleast_2d(SL.spin_centers[idxs])
-                dummy_SL.spin_weights = SL.spin_weights
-                dummy_SL.weights = SL.weights[idxs]
-                dummy_SL.weights /= dummy_SL.weights.sum()
-                dummy_labels.append(dummy_SL)
-
-            Ps.append(
-                pair_dd(
-                    *dummy_labels, r=r, sigma=sigma, use_spin_centers=use_spin_centers
-                )
-            )
-        Ps = np.array(Ps)
-        return Ps
-
+        if uq:
+            return P, P_low, P_high
+        else:
+            return P
     else:
-        P = pair_dd(
-            *args,
-            r=r,
-            sigma=sigma,
-            use_spin_centers=use_spin_centers,
-            dependent=dependent,
+        if uq:
+            P = pair_dd(
+                *args,
+                r=r,
+                sigma=sigma,
+                use_spin_centers=use_spin_centers,
+                dependent=dependent,
+            )
+
+            Ps = []
+            n_boots = uq if uq > 1 else 1000
+            for i in range(n_boots):
+                dummy_labels = []
+                for SL in args:
+                    idxs = np.random.choice(len(SL), len(SL))
+
+                    dummy_SL = mock.Mock()
+                    dummy_SL.spin_coords = np.atleast_2d(SL.spin_coords[idxs])
+                    dummy_SL.spin_centers = np.atleast_2d(SL.spin_centers[idxs])
+                    dummy_SL.spin_weights = SL.spin_weights
+                    dummy_SL.weights = SL.weights[idxs]
+                    dummy_SL.weights /= dummy_SL.weights.sum()
+                    dummy_labels.append(dummy_SL)
+
+                Ps.append(
+                    pair_dd(
+                        *dummy_labels, r=r, sigma=sigma, use_spin_centers=use_spin_centers
+                    )
+                )
+            Ps = np.array(Ps)
+            P_low = np.percentile(Ps, 5, axis=0)
+            P_high = np.percentile(Ps, 95, axis=0)
+
+            return P, P_low, P_high
+
+        else:
+            P = pair_dd(
+                *args,
+                r=r,
+                sigma=sigma,
+                use_spin_centers=use_spin_centers,
+                dependent=dependent,
+            )
+            return P
+
+def compute_distances_and_weights(
+    _SL1,
+    _SL2,
+    r: "ArrayLike",
+    sigma: float = 1.0,
+    use_spin_centers: bool = True,
+    dependent: bool = False,
+) -> np.ndarray:
+    if use_spin_centers:
+        coords1 = _SL1.spin_centers
+        coords2 = _SL2.spin_centers
+        weights1 = _SL1.weights
+        weights2 = _SL2.weights
+    else:
+        coords1 = _SL1.spin_coords.reshape(-1, 3)
+        coords2 = _SL2.spin_coords.reshape(-1, 3)
+        weights1 = np.outer(_SL1.weights, _SL1.spin_weights).flatten()
+        weights2 = np.outer(_SL2.weights, _SL2.spin_weights).flatten()
+
+    frame_dist = cdist(coords1, coords2).flatten()
+    frame_weights = np.outer(weights1, weights2).flatten()
+
+    if dependent:
+        if not isinstance(_SL1.energy_func, ljEnergyFunc):
+            raise RuntimeError(
+                "Currently only ljEnergyFunc objects are supported when using dependent=True"
+            )
+
+        if (
+            _SL1.energy_func.join_rmin is not _SL2.energy_func.join_rmin
+            or _SL1.energy_func.join_eps is not _SL2.energy_func.join_eps
+        ):
+            raise RuntimeError(
+                "At least two labels passed use different energy functions. Make sure all "
+                "labels use the same energy functions when setting `dependent=True`. This does not"
+                "mean that the energy functions use the same parameters. They have to be the SAME "
+                "object and satisfy `SL1.energy_func is SL2.energy_func`. This can be achieved be "
+                "creating an energy function object"
+            )
+
+        nat1, nat2 = len(_SL1.side_chain_idx), len(_SL2.side_chain_idx)
+        join_rmin = _SL1.energy_func.join_rmin
+        join_eps = _SL1.energy_func.join_eps
+
+        rmin_ij = join_rmin(_SL1.rmin2, _SL2.rmin2)
+        eps_ij = join_eps(_SL1.eps, _SL2.eps)
+
+        rot_coords1 = _SL1.coords[:, _SL1.side_chain_idx]
+        rot_coords2 = _SL2.coords[:, _SL2.side_chain_idx].reshape(-1, 3)
+
+        ljs = []
+        for rots in rot_coords1:
+            lj = cdist(rots, rot_coords2)
+            lj = lj.reshape(1, nat1, len(_SL2), nat2).transpose(0, 2, 1, 3)
+
+            lj = rmin_ij[None, None, ...] / lj
+            lj = lj * lj * lj
+            lj = lj * lj
+            lj = lj * lj
+
+            # Cap
+            lj[lj > 10] = 10
+            # Rep only
+            lj = eps_ij * (lj * lj)
+            lj = lj.sum(axis=(2, 3))
+            ljs.append(lj)
+
+        ljs = np.concatenate(ljs)
+        frame_weights, _ = reweight_rotamers(
+            ljs.flatten(), _SL1.temp, frame_weights
         )
-        return P
+    return frame_dist, frame_weights
 
 
 def pair_dd(
@@ -176,7 +264,7 @@ def pair_dd(
     r : ArrayLike
         Distance domain vector, in angstrom
     sigma : float
-         Standard deviation of normal distribution used for convolution, in angstrom
+        Standard deviation of normal distribution used for convolution, in angstrom
     use_spin_centers : bool
         If False, distances are computed between spin centers. If True, distances are computed by summing over
         the distributed spin density on spin-bearing atoms on the labels.
@@ -193,68 +281,16 @@ def pair_dd(
     SL_Pairs = combinations(args, 2)
     weights, distances = [], []
     for SL1, SL2 in SL_Pairs:
-        if use_spin_centers:
-            coords1 = SL1.spin_centers
-            coords2 = SL2.spin_centers
-            weights1 = SL1.weights
-            weights2 = SL2.weights
-        else:
-            coords1 = SL1.spin_coords.reshape(-1, 3)
-            coords2 = SL2.spin_coords.reshape(-1, 3)
-            weights1 = np.outer(SL1.weights, SL1.spin_weights).flatten()
-            weights2 = np.outer(SL2.weights, SL2.spin_weights).flatten()
-
-        distances.append(cdist(coords1, coords2).flatten())
-        weights.append(np.outer(weights1, weights2).flatten())
-
-        if dependent:
-            if not isinstance(SL1.energy_func, ljEnergyFunc):
-                raise RuntimeError(
-                    "Currently only ljEnergyFunc objects are supported when using dependent=True"
-                )
-
-            if (
-                SL1.energy_func.join_rmin is not SL2.energy_func.join_rmin
-                or SL1.energy_func.join_eps is not SL2.energy_func.join_eps
-            ):
-                raise RuntimeError(
-                    "At least two labels passed use different energy functions. Make sure all "
-                    "labels use the same energy functions when setting `dependent=True`. This does not"
-                    "mean that the energy functions use the same parameters. They have to be the SAME "
-                    "object and satisfy `SL1.energy_func is SL2.energy_func`. This can be achieved be "
-                    "creating an energy function object"
-                )
-
-            nrot1, nrot2 = len(SL1), len(SL2)
-            nat1, nat2 = len(SL1.side_chain_idx), len(SL2.side_chain_idx)
-            join_rmin = SL1.energy_func.join_rmin
-            join_eps = SL1.energy_func.join_eps
-
-            rmin_ij = join_rmin(SL1.rmin2, SL2.rmin2)
-            eps_ij = join_eps(SL1.eps, SL2.eps)
-
-            rot_coords1 = SL1.coords[:, SL1.side_chain_idx]
-            rot_coords2 = SL2.coords[:, SL2.side_chain_idx].reshape(-1, 3)
-
-            ljs = []
-            for i, rots in enumerate(rot_coords1):
-                lj = cdist(rots, rot_coords2)
-                lj = lj.reshape(1, nat1, nrot2, nat2).transpose(0, 2, 1, 3)
-
-                lj = rmin_ij[None, None, ...] / lj
-                lj = lj * lj * lj
-                lj = lj * lj
-                lj = lj * lj
-
-                # Cap
-                lj[lj > 10] = 10
-                # Rep only
-                lj = eps_ij * (lj * lj)
-                lj = lj.sum(axis=(2, 3))
-                ljs.append(lj)
-
-            ljs = np.concatenate(ljs)
-            weights[-1], _ = reweight_rotamers(ljs.flatten(), SL1.temp, weights[-1])
+        pair_dist, pair_weight = compute_distances_and_weights(
+            SL1, 
+            SL2, 
+            r, 
+            sigma=sigma,
+            use_spin_centers=use_spin_centers,
+            dependent=dependent
+        )
+        distances.append(pair_dist)
+        weights.append(pair_weight)
 
     distances = np.concatenate(distances)
     weights = np.concatenate(weights)
@@ -291,6 +327,7 @@ def traj_dd(
     use_spin_centers: bool = True,
     dependent: bool = False,
     average_mode: str = "frame",
+    uq: bool = False,
     **kwargs,
 ) -> np.ndarray:
     """Calculate a distance distribution from a trajectory of spin labels by calling ``distance_distribution`` on each
@@ -312,6 +349,8 @@ def traj_dd(
     average_mode : str
         ``"frame"`` averages per-frame normalized distributions.
         ``"pooled"`` computes one pooled histogram over all trajectory frames before normalization.
+    uq : bool
+        Perform uncertainty analysis (experimental). Can only be used with average_mode pooled right now
     **kwargs : dict, optional
         Additional keyword arguments to pass to ``distance_distribution`` .
 
@@ -329,6 +368,8 @@ def traj_dd(
         raise ValueError("average_mode must be one of {'frame', 'pooled'}")
 
     if average_mode == "frame":
+        if uq:
+            raise NotImplementedError("Uncertainty analysis is only implemented for average_mode pool")
         # Calculate a normalized distance distribution for each frame and average them.
         P = np.zeros_like(r)
         for _SL1, _SL2 in zip(SL1, SL2):
@@ -340,74 +381,23 @@ def traj_dd(
                 use_spin_centers=use_spin_centers,
                 dependent=dependent,
             )
+        # Normalize distance distribution
+        P /= np.trapz(P, r)
+
+        return P, None, None
 
     else:
         # Pool weighted distances across all frames and build one global histogram.
         distances, weights = [], []
         for _SL1, _SL2 in zip(SL1, SL2):
-            if use_spin_centers:
-                coords1 = _SL1.spin_centers
-                coords2 = _SL2.spin_centers
-                weights1 = _SL1.weights
-                weights2 = _SL2.weights
-            else:
-                coords1 = _SL1.spin_coords.reshape(-1, 3)
-                coords2 = _SL2.spin_coords.reshape(-1, 3)
-                weights1 = np.outer(_SL1.weights, _SL1.spin_weights).flatten()
-                weights2 = np.outer(_SL2.weights, _SL2.spin_weights).flatten()
-
-            frame_dist = cdist(coords1, coords2).flatten()
-            frame_weights = np.outer(weights1, weights2).flatten()
-
-            if dependent:
-                if not isinstance(_SL1.energy_func, ljEnergyFunc):
-                    raise RuntimeError(
-                        "Currently only ljEnergyFunc objects are supported when using dependent=True"
-                    )
-
-                if (
-                    _SL1.energy_func.join_rmin is not _SL2.energy_func.join_rmin
-                    or _SL1.energy_func.join_eps is not _SL2.energy_func.join_eps
-                ):
-                    raise RuntimeError(
-                        "At least two labels passed use different energy functions. Make sure all "
-                        "labels use the same energy functions when setting `dependent=True`. This does not"
-                        "mean that the energy functions use the same parameters. They have to be the SAME "
-                        "object and satisfy `SL1.energy_func is SL2.energy_func`. This can be achieved be "
-                        "creating an energy function object"
-                    )
-
-                nat1, nat2 = len(_SL1.side_chain_idx), len(_SL2.side_chain_idx)
-                join_rmin = _SL1.energy_func.join_rmin
-                join_eps = _SL1.energy_func.join_eps
-
-                rmin_ij = join_rmin(_SL1.rmin2, _SL2.rmin2)
-                eps_ij = join_eps(_SL1.eps, _SL2.eps)
-
-                rot_coords1 = _SL1.coords[:, _SL1.side_chain_idx]
-                rot_coords2 = _SL2.coords[:, _SL2.side_chain_idx].reshape(-1, 3)
-
-                ljs = []
-                for rots in rot_coords1:
-                    lj = cdist(rots, rot_coords2)
-                    lj = lj.reshape(1, nat1, len(_SL2), nat2).transpose(0, 2, 1, 3)
-
-                    lj = rmin_ij[None, None, ...] / lj
-                    lj = lj * lj * lj
-                    lj = lj * lj
-                    lj = lj * lj
-
-                    # Cap
-                    lj[lj > 10] = 10
-                    # Rep only
-                    lj = eps_ij * (lj * lj)
-                    lj = lj.sum(axis=(2, 3))
-                    ljs.append(lj)
-
-                ljs = np.concatenate(ljs)
-                frame_weights, _ = reweight_rotamers(
-                    ljs.flatten(), _SL1.temp, frame_weights
-                )
+            frame_dist, frame_weights = compute_distances_and_weights(
+                _SL1, 
+                _SL2, 
+                r, 
+                sigma=sigma,
+                use_spin_centers=use_spin_centers,
+                dependent=dependent
+            )
 
             distances.append(frame_dist)
             weights.append(frame_weights)
@@ -429,10 +419,61 @@ def traj_dd(
         else:
             P = hist
 
-    # Normalize distance distribution
-    P /= np.trapz(P, r)
+        # Normalize distance distribution
+        P /= np.trapz(P, r)
 
-    return P
+        if uq:
+            n_boots = uq if uq > 1 else 1000
+            n_frames = min(len(SL1), len(SL2))
+            if n_boots <= 0 or n_frames == 0:
+                return P, None, None
+            rng = np.random.default_rng(42)
+            p_boot = np.zeros((n_boots, len(P)), dtype=np.float64)
+            for i in range(n_boots):
+                idxs = rng.choice(n_frames, size=n_frames, replace=True)
+                sl1_sub = SL1[idxs]
+                sl2_sub = SL2[idxs]
+                distances, weights = [], []
+                for _SL1, _SL2 in zip(sl1_sub, sl2_sub):
+                    frame_dist, frame_weights = compute_distances_and_weights(
+                        _SL1, 
+                        _SL2, 
+                        r, 
+                        sigma=sigma,
+                        use_spin_centers=use_spin_centers,
+                        dependent=dependent
+                    )
+
+                    distances.append(frame_dist)
+                    weights.append(frame_weights)
+
+                distances = np.concatenate(distances)
+                weights = np.concatenate(weights)
+
+                hist, _ = np.histogram(
+                    distances, weights=weights, range=(min(r), max(r)), bins=len(r)
+                )
+
+                if sigma != 0:
+                    delta_r = get_delta_r(r)
+                    _, g = normdist(delta_r, 0, sigma)
+                    if len(g) > len(hist):
+                        start = (len(g) - len(hist)) // 2
+                        g = g[start : start + len(hist)]
+                    P_b = np.convolve(hist, g, mode="same")
+                else:
+                    P_b = hist
+
+                # Normalize distance distribution
+                P_b /= np.trapz(P_b, r)
+                p_boot[i] = P_b
+            P_low = np.percentile(p_boot, 5, axis=0)
+            P_high = np.percentile(p_boot, 95, axis=0)
+
+            return P, P_low, P_high
+
+        else:
+            return P, None, None
 
 
 def confidence_interval(
